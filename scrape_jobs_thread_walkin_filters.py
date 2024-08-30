@@ -1,6 +1,7 @@
 import time
 import math
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -35,7 +36,7 @@ def get_total_jobs(driver, base_url, query_params):
         total_jobs = int(total_jobs_text.replace(',', ''))
         return total_jobs
     except (TimeoutException, NoSuchElementException, ValueError) as e:
-        print(f"An error occurred while retrieving total jobs: {e}")
+        print(f"An error occurred while retrieving total jobs: ")
         return 0
 
 def calculate_max_pages(total_jobs, jobs_per_page=20):
@@ -47,15 +48,13 @@ def extract_job_details(job):
     try:
         job_title = job.find_element(By.CSS_SELECTOR, '.title').text
         company = job.find_element(By.CSS_SELECTOR, '.comp-name').text
-        experience = job.find_element(By.CSS_SELECTOR, '.exp-wrap .exp').text if job.find_elements(By.CSS_SELECTOR, '.exp-wrap .exp') else "N/A"
-        location = job.find_element(By.CSS_SELECTOR, '.locWdth').text if job.find_elements(By.CSS_SELECTOR, '.locWdth') else "N/A"
         salary_elements = job.find_elements(By.CSS_SELECTOR, '.sal-wrap .ni-job-tuple-icon span')
         salary = salary_elements[0].get_attribute('title').strip() if salary_elements else "Not disclosed"
         apply_url = job.find_element(By.CSS_SELECTOR, '.title').get_attribute('href')
-        return job_title, company, experience, location, salary, apply_url
+        return job_title, company, salary, apply_url
     except NoSuchElementException as e:
         print(f"Failed to extract job details: {e}")
-        return "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"
+        return "N/A", "N/A", "N/A", "N/A"
 
 def extract_walkin_details(driver, apply_url):
     """Extract walk-in details from a job listing."""
@@ -67,6 +66,9 @@ def extract_walkin_details(driver, apply_url):
         time_element = driver.find_element(By.CSS_SELECTOR, '.styles_jhc__walkin__57j_D').text.strip()
         venue_element = driver.find_element(By.CSS_SELECTOR, '.styles_jhc__venue__2cqi5').text.strip()
 
+        # Extract the experience
+        experience_element = driver.find_element(By.CSS_SELECTOR, '.styles_jhc__exp__k_giM span').text.strip() if driver.find_elements(By.CSS_SELECTOR, '.styles_jhc__exp__k_giM span') else "N/A"
+        
         try:
             read_more_button = driver.find_element(By.CLASS_NAME, "styles_read-more-link__dD_5h")
             read_more_button.click()
@@ -79,11 +81,11 @@ def extract_walkin_details(driver, apply_url):
         job_desc_element = driver.find_element(By.CLASS_NAME, "styles_JDC__dang-inner-html__h0K4t")
         job_desc = job_desc_element.get_attribute('innerHTML').strip()
 
-        return time_element, venue_element, job_desc
+        return experience_element, time_element, venue_element, job_desc
 
     except (NoSuchElementException, TimeoutException) as e:
         print(f"Failed to extract walk-in details: {e}")
-        return "N/A", "N/A", "N/A"
+        return "N/A", "N/A", "N/A", "N/A"
 
 def write_job_to_csv(writer, city_info, job_details):
     """Write job details to the CSV file."""
@@ -93,30 +95,32 @@ def write_job_to_csv(writer, city_info, job_details):
         'INDUSTRY ID': city_info['INDUSTRY ID'],
         'Job Title': job_details[0],
         'Company': job_details[1],
-        'Experience': job_details[2],
-        'Location': job_details[3],
-        'Salary': job_details[4],
-        'Apply URL': job_details[5],
-        'Walk-in': job_details[6],
-        'Time': job_details[7],
-        'Venue': job_details[8],
-        'Job Description': job_details[9]
+        'Salary': job_details[2],
+        'Apply URL': job_details[3],
+        'Walk-in': job_details[4],
+        'Experience': job_details[5],
+        'Time': job_details[6],
+        'Venue': job_details[7],
+        'Job Description': job_details[8]
     }
     writer.writerow(job_data)
 
-def process_job_listings(driver, jobs, city_info, writer):
-    """Process and extract details from each job listing."""
-    print(f"Processing {len(jobs)} job listings.")
-    for job in jobs:
-        try:
-            job_details = extract_job_details(job)
-            walkin = "Yes" if job.find_elements(By.CSS_SELECTOR, '.ttc__walk-in') else "No"
-            time, venue, job_desc = ("N/A", "N/A", "N/A")
-            if walkin == "Yes":
-                time, venue, job_desc = extract_walkin_details(driver, job_details[5])
-            write_job_to_csv(writer, city_info, job_details + (walkin, time, venue, job_desc))
-        except Exception as e:
-            print(f"Error processing job: {e}")
+def process_job(driver, job, city_info, writer):
+    """Process and extract details from a single job listing."""
+    try:
+        job_details = extract_job_details(job)
+        walkin = "Yes" if job.find_elements(By.CSS_SELECTOR, '.ttc__walk-in') else "No"
+        
+        if walkin == "Yes":
+            experience, time, venue, job_desc = extract_walkin_details(driver, job_details[3])
+        else:
+            experience, time, venue, job_desc = "N/A", "N/A", "N/A", "N/A"
+        
+        write_job_to_csv(writer, city_info, job_details + (walkin, experience, time, venue, job_desc))
+    except Exception as e:
+        print(f"Error processing job: {e}")
+
+
 
 def scrape_jobs(driver, base_url, query_params, city_info, writer):
     """Scrape job listings from multiple pages."""
@@ -140,7 +144,12 @@ def scrape_jobs(driver, base_url, query_params, city_info, writer):
                 print("No more jobs found. Exiting loop.")
                 break
 
-            process_job_listings(driver, job_listings, city_info, writer)
+            # Use ThreadPoolExecutor to process job listings concurrently
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                futures = [executor.submit(process_job, driver, job, city_info, writer) for job in job_listings]
+                for future in as_completed(futures):
+                    future.result()  # To raise exceptions if any
+
             print(f"Completed page {page_number}.")
 
         except TimeoutException as e:
@@ -151,7 +160,7 @@ def scrape_jobs(driver, base_url, query_params, city_info, writer):
             continue
 
 def main():
-    with open('params1.csv', 'r') as file:
+    with open('params.csv', 'r') as file:
         reader = csv.DictReader(file)
         query_urls = list(reader)
 
@@ -162,8 +171,8 @@ def main():
 
         with open('all_job_listings_params_test1page.csv', 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
-                'City Key', 'City', 'INDUSTRY ID', 'Job Title', 'Company', 'Experience',
-                'Location', 'Salary', 'Apply URL', 'Walk-in', 'Time', 'Venue', 'Job Description'
+                'City Key', 'City', 'INDUSTRY ID', 'Job Title', 'Company', 
+                'Salary', 'Apply URL', 'Walk-in','Experience', 'Time', 'Venue', 'Job Description'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
